@@ -1,10 +1,7 @@
 """
 Aplikasi Penarikan Kesimpulan Pemeriksaan Kepatuhan — Streamlit (single-file)
-==============================================================================
-Menjalankan:
-    pip install streamlit pandas openpyxl
-    streamlit run app.py
-==============================================================================
+Tata letak per-aspek tuntas (blok expander), bobot dalam %.
+Menjalankan:  pip install streamlit pandas openpyxl ;  streamlit run app.py
 """
 
 from __future__ import annotations
@@ -657,48 +654,109 @@ SUB_SEED = pd.DataFrame(
 st.set_page_config(page_title="Matriks Penyimpulan Pemeriksaan Kepatuhan",
                    page_icon="📋", layout="wide")
 
-# ---------------------------------------------------------------- state init
-# PENTING: widget teks (text_area/text_input) di bawah diikat via `key=` ke
-# st.session_state, BUKAN lewat pola `value=... lalu reassign manual`.
-# Pola lama (`m["x"] = st.text_area("...", m.get("x",""))`) membuat Streamlit
-# menganggap tiap perubahan value sebagai widget baru (karena tidak ada key
-# eksplisit, key di-auto-generate dari value) -> input yang baru diketik
-# "hilang" dan harus dikonfirmasi ulang (perlu Ctrl+Enter 2x). Dengan `key=`,
-# Streamlit langsung menjadikan session_state sebagai sumber kebenaran tunggal
-# sehingga satu kali Ctrl+Enter/Enter sudah cukup.
-_META_KEYS = {  # session_state key -> field metadata
-    "meta_tujuan": "tujuan",
-    "meta_subject_matter": "subject_matter",
-    "meta_lingkup": "lingkup",
-    "meta_total_kontrak": "total_kontrak",
-    "meta_sampling": "sampling",
-}
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+SUB_COLS = ["no", "kriteria", "bobot", "pertimbangan", "temuan", "mode",
+            "skala_langsung", "Nilai", "Dampak", "Sensitivitas", "Fraud"]
+_META_KEYS = {"meta_tujuan": "tujuan", "meta_subject_matter": "subject_matter",
+              "meta_lingkup": "lingkup", "meta_total_kontrak": "total_kontrak",
+              "meta_sampling": "sampling"}
 
-if "aspek" not in st.session_state:
-    st.session_state.aspek = ASPEK_SEED.copy()
-    st.session_state.sub = SUB_SEED.copy()
-    for _skey, _mkey in _META_KEYS.items():
-        st.session_state[_skey] = METADATA_DEFAULT.get(_mkey, "")
+
+def empty_sub_df():
+    return pd.DataFrame({c: pd.Series(dtype="object") for c in SUB_COLS})
+
+
+def build_seed_state():
+    """Bangun aspek_list (bobot dalam %) + sub_data {id: df kriteria %} dari seed desimal."""
+    aspek_list, sub_data = [], {}
+    for i, (_, ar) in enumerate(ASPEK_SEED.iterrows()):
+        aid = f"a{i}"
+        aspek_list.append({
+            "id": aid,
+            "nama": str(ar.get("nama", "") or ""),
+            "bobot": round(float(ar.get("bobot_aspek") or 0) * 100, 3),
+            "pertimbangan": str(ar.get("pertimbangan", "") or ""),
+        })
+        kode = str(ar.get("kode", "") or "").strip()
+        rows = SUB_SEED[SUB_SEED["kode_aspek"].astype(str).str.strip() == kode]
+        recs = []
+        for _, s in rows.iterrows():
+            recs.append({
+                "no": s.get("no"),
+                "kriteria": s.get("kriteria", ""),
+                "bobot": round(float(s.get("bobot_kriteria") or 0) * 100, 3),
+                "pertimbangan": s.get("pertimbangan", ""),
+                "temuan": s.get("temuan", ""),
+                "mode": s.get("mode", "Parameter"),
+                "skala_langsung": s.get("skala_langsung"),
+                "Nilai": s.get("Nilai"), "Dampak": s.get("Dampak"),
+                "Sensitivitas": s.get("Sensitivitas"), "Fraud": s.get("Fraud"),
+            })
+        sub_data[aid] = pd.DataFrame(recs, columns=SUB_COLS) if recs else empty_sub_df()
+    return aspek_list, sub_data
+
+
+def init_state(aspek_list, sub_data, meta):
+    st.session_state.aspek_list = aspek_list
+    st.session_state.sub_data = sub_data
+    st.session_state.next_id = len(aspek_list)
+    for k, mk in _META_KEYS.items():
+        st.session_state[k] = meta.get(mk, "")
     st.session_state.judgment_text = ""
 
-# ---------------------------------------------------------------- sidebar
+
+if "aspek_list" not in st.session_state:
+    _al, _sd = build_seed_state()
+    init_state(_al, _sd, METADATA_DEFAULT)
+
+
+def assemble():
+    """Rakit dua DataFrame desimal (kode berbasis urutan) untuk engine & exporter."""
+    aspek_rows, sub_rows = [], []
+    for i, a in enumerate(st.session_state.aspek_list):
+        aid = a["id"]
+        kode = LETTERS[i] if i < len(LETTERS) else f"A{i}"
+        nama = a.get("nama", "")
+        bobot_pct = a.get("bobot", 0) or 0
+        pert = a.get("pertimbangan", "")
+        aspek_rows.append({"kode": kode, "nama": nama,
+                           "bobot_aspek": float(bobot_pct) / 100, "pertimbangan": pert})
+        sdf = st.session_state.sub_data.get(aid, empty_sub_df())
+        for _, r in sdf.iterrows():
+            if not str(r.get("kriteria", "") or "").strip():
+                continue
+            sub_rows.append({
+                "kode_aspek": kode, "no": r.get("no"),
+                "kriteria": r.get("kriteria", ""),
+                "bobot_kriteria": (float(r.get("bobot") or 0)) / 100,
+                "temuan": r.get("temuan", ""), "pertimbangan": r.get("pertimbangan", ""),
+                "mode": r.get("mode", "Parameter"), "skala_langsung": r.get("skala_langsung"),
+                "Nilai": r.get("Nilai"), "Dampak": r.get("Dampak"),
+                "Sensitivitas": r.get("Sensitivitas"), "Fraud": r.get("Fraud"),
+            })
+    df_a = pd.DataFrame(aspek_rows, columns=["kode", "nama", "bobot_aspek", "pertimbangan"])
+    df_s = pd.DataFrame(sub_rows, columns=["kode_aspek", "no", "kriteria", "bobot_kriteria",
+                                           "temuan", "pertimbangan", "mode", "skala_langsung",
+                                           "Nilai", "Dampak", "Sensitivitas", "Fraud"])
+    return df_a, df_s
+
+
+# ================================================================ sidebar
 with st.sidebar:
     st.header("⚙️ Pengaturan")
-    batas = st.number_input("Batas penyimpangan (skala)", 0.0, 3.0,
-                            value=0.3, step=0.05,
-                            help="Default 0,3 (≈10%). Diproporsionalkan per sub-aspek: batas × nilai tertimbang.")
+    batas = st.number_input("Batas penyimpangan (skala)", 0.0, 3.0, value=0.3, step=0.05,
+                            help="Default 0,3 (≈10%). Diproporsionalkan per sub-aspek.")
     amb_sesuai = st.number_input("Ambang SESUAI (< nilai ini)", 0.0, 4.0, value=1.3, step=0.1)
     amb_tidak = st.number_input("Ambang TIDAK SESUAI (> nilai ini)", 0.0, 4.0, value=1.8, step=0.1)
 
     st.divider()
     st.subheader("Bobot parameter temuan (Lamp 6.3)")
     sama_rata = st.toggle("Sama rata (default)", value=True,
-                          help="Aktif: skala = rata-rata sederhana Nilai/Dampak/Sensitivitas/Fraud. "
-                               "Nonaktif: tentukan bobot tiap parameter (mis. 40/30/10/20).")
+                          help="Nonaktif: tentukan bobot tiap parameter (mis. 40/30/10/20).")
     if sama_rata:
         bobot_param = {p: 0.25 for p in PARAMETER_TEMUAN}
     else:
-        st.caption("Bobot dinormalkan otomatis (tak harus total 100%).")
+        st.caption("Bobot dinormalkan otomatis.")
         wN = st.number_input("Nilai (%)", 0, 100, value=40, step=5)
         wD = st.number_input("Dampak (%)", 0, 100, value=30, step=5)
         wS = st.number_input("Sensitivitas (%)", 0, 100, value=10, step=5)
@@ -706,29 +764,21 @@ with st.sidebar:
         tot = (wN + wD + wS + wF) or 1
         bobot_param = {"Nilai": wN / tot, "Dampak": wD / tot,
                        "Sensitivitas": wS / tot, "Fraud": wF / tot}
-        st.caption("Efektif: " + " · ".join(f"{p} {bobot_param[p]*100:.0f}%" for p in PARAMETER_TEMUAN))
 
     cfg = Config(batas_penyimpangan=batas, ambang_sesuai=amb_sesuai,
                  ambang_tidak_sesuai=amb_tidak, bobot_parameter=bobot_param)
 
     st.divider()
-    st.caption("Reset ke data contoh workbook:")
     if st.button("↺ Muat ulang data contoh", width='stretch'):
-        st.session_state.aspek = ASPEK_SEED.copy()
-        st.session_state.sub = SUB_SEED.copy()
-        for _skey, _mkey in _META_KEYS.items():
-            st.session_state[_skey] = METADATA_DEFAULT.get(_mkey, "")
-        st.session_state.judgment_text = ""
-        st.rerun()
+        _al, _sd = build_seed_state(); init_state(_al, _sd, METADATA_DEFAULT); st.rerun()
     if st.button("🗑️ Kosongkan semua", width='stretch'):
-        st.session_state.aspek = ASPEK_SEED.iloc[0:0].copy()
-        st.session_state.sub = SUB_SEED.iloc[0:0].copy()
-        st.rerun()
+        init_state([], {}, {k: "" for k in METADATA_DEFAULT}); st.rerun()
 
 st.title("📋 Matriks Penyimpulan Pemeriksaan Kepatuhan")
-st.caption("Replikasi Lampiran 6.1–6.4 · pembobotan Aspek → Sub-aspek → Temuan · rekalkulasi otomatis")
+st.caption("Alur per-aspek tuntas · Aspek → Sub-aspek/Kriteria → Temuan · bobot dalam % · "
+           "rekalkulasi otomatis · tak perlu Enter (klik ke luar sel sudah tersimpan)")
 
-# ---------------------------------------------------------------- metadata
+# ================================================================ metadata
 with st.expander("🧾 Identitas Pemeriksaan", expanded=False):
     c1, c2 = st.columns(2)
     c1.text_area("Tujuan Pemeriksaan", key="meta_tujuan", height=70)
@@ -737,113 +787,110 @@ with st.expander("🧾 Identitas Pemeriksaan", expanded=False):
     c2.text_input("Total Kontrak", key="meta_total_kontrak")
     c1.text_input("Sampling", key="meta_sampling")
 
-meta = {_mkey: st.session_state[_skey] for _skey, _mkey in _META_KEYS.items()}
+# ================================================================ kontrol global aspek
+st.subheader("1️⃣ Aspek & Kriteria (per-aspek)")
+tot_aspek = sum(float(st.session_state.get(f"bobot_{a['id']}", a.get("bobot", 0)) or 0)
+                for a in st.session_state.aspek_list)
+cc1, cc2 = st.columns([3, 1])
+(cc1.success if abs(tot_aspek - 100) <= 0.1 else cc1.error)(
+    f"Σ bobot aspek = {tot_aspek:.1f}%" + ("  ✓" if abs(tot_aspek - 100) <= 0.1 else "  (harus 100%)"))
+if cc2.button("➕ Tambah aspek", width='stretch'):
+    nid = f"a{st.session_state.next_id}"; st.session_state.next_id += 1
+    st.session_state.aspek_list.append({"id": nid, "nama": "", "bobot": 0.0, "pertimbangan": ""})
+    st.session_state.sub_data[nid] = empty_sub_df()
+    st.rerun()
 
-# ---------------------------------------------------------------- input aspek
-st.subheader("1️⃣ Aspek & Bobot")
-st.caption("Σ bobot aspek harus = 1,000. Tambah/hapus baris lewat tabel.")
-aspek_ed = st.data_editor(
-    st.session_state.aspek, num_rows="dynamic", width='stretch',
-    key="ed_aspek",
-    column_config={
-        "kode": st.column_config.TextColumn("Kode", width="small", required=True),
-        "nama": st.column_config.TextColumn("Nama Aspek", width="medium"),
-        "bobot_aspek": st.column_config.NumberColumn("Bobot", min_value=0.0,
-                                                     max_value=1.0, step=0.05, format="%.3f"),
-        "pertimbangan": st.column_config.TextColumn("Pertimbangan (Lamp 6.1)", width="large"),
-    })
-st.session_state.aspek = aspek_ed
-tot_aspek = pd.to_numeric(aspek_ed["bobot_aspek"], errors="coerce").fillna(0).sum()
-(st.success if abs(tot_aspek - 1) <= 0.001 else st.error)(
-    f"Σ bobot aspek = {tot_aspek:.3f}" + ("" if abs(tot_aspek - 1) <= 0.001 else "  (harus 1,000)"))
+sub_colcfg = {
+    "no": st.column_config.NumberColumn("No", width="small", step=1),
+    "kriteria": st.column_config.TextColumn("Sub-Aspek / Kriteria", width="large"),
+    "bobot": st.column_config.NumberColumn("Bobot (%)", min_value=0.0, max_value=100.0,
+                                           step=1.0, format="%.1f"),
+    "pertimbangan": st.column_config.TextColumn("Pertimbangan (Lamp 6.2)", width="medium"),
+    "temuan": st.column_config.TextColumn("Temuan (catatan)", width="medium"),
+    "mode": st.column_config.SelectboxColumn("Mode", options=["Parameter", "Langsung"], width="small"),
+    "skala_langsung": st.column_config.NumberColumn("Skala Langsung", min_value=1.0, max_value=4.0,
+                                                    step=0.25, format="%.2f"),
+    "Nilai": st.column_config.NumberColumn("Nilai", min_value=1.0, max_value=4.0, step=0.5),
+    "Dampak": st.column_config.NumberColumn("Dampak", min_value=1.0, max_value=4.0, step=0.5),
+    "Sensitivitas": st.column_config.NumberColumn("Sensitiv.", min_value=1.0, max_value=4.0, step=0.5),
+    "Fraud": st.column_config.NumberColumn("Fraud", min_value=1.0, max_value=4.0, step=0.5),
+}
 
-# ---------------------------------------------------------------- input sub-aspek
-st.subheader("2️⃣ Sub-Aspek / Kriteria & Skala Temuan")
-_skema = ("rata-rata sederhana (bobot parameter sama)" if cfg.parameter_sama_rata
-          else "rata-rata tertimbang: " + ", ".join(
-              f"{p} {cfg.bobot_parameter[p]*100:.0f}%" for p in PARAMETER_TEMUAN))
-st.caption(f"Mode **Parameter**: isi Nilai/Dampak/Sensitivitas/Fraud (1–4), skala dihitung "
-           f"dengan {_skema}. Mode **Langsung**: pakai kolom *Skala Langsung* (1–4). "
-           f"Ubah skema bobot parameter di sidebar.")
-kode_opsi = [str(k).strip() for k in aspek_ed["kode"].dropna().tolist() if str(k).strip()]
-sub_ed = st.data_editor(
-    st.session_state.sub, num_rows="dynamic", width='stretch',
-    key="ed_sub",
-    column_config={
-        "kode_aspek": st.column_config.SelectboxColumn("Aspek", options=kode_opsi,
-                                                       width="small", required=True),
-        "no": st.column_config.NumberColumn("No", width="small", step=1),
-        "kriteria": st.column_config.TextColumn("Sub-Aspek / Kriteria", width="large"),
-        "bobot_kriteria": st.column_config.NumberColumn("Bobot", min_value=0.0,
-                                                        max_value=1.0, step=0.05, format="%.3f"),
-        "pertimbangan": st.column_config.TextColumn("Pertimbangan (Lamp 6.2)", width="medium"),
-        "temuan": st.column_config.TextColumn("Temuan", width="medium"),
-        "mode": st.column_config.SelectboxColumn("Mode", options=["Parameter", "Langsung"],
-                                                 width="small"),
-        "skala_langsung": st.column_config.NumberColumn("Skala Langsung", min_value=1.0,
-                                                        max_value=4.0, step=0.25, format="%.2f"),
-        "Nilai": st.column_config.NumberColumn("Nilai", min_value=1.0, max_value=4.0, step=0.5),
-        "Dampak": st.column_config.NumberColumn("Dampak", min_value=1.0, max_value=4.0, step=0.5),
-        "Sensitivitas": st.column_config.NumberColumn("Sensitiv.", min_value=1.0, max_value=4.0, step=0.5),
-        "Fraud": st.column_config.NumberColumn("Fraud", min_value=1.0, max_value=4.0, step=0.5),
-    })
-st.session_state.sub = sub_ed
+to_delete = []
+for i, a in enumerate(st.session_state.aspek_list):
+    aid = a["id"]
+    kode = LETTERS[i] if i < len(LETTERS) else f"A{i}"
+    nama_now = st.session_state.get(f"nama_{aid}", a.get("nama", "")) or "(tanpa nama)"
+    bobot_now = st.session_state.get(f"bobot_{aid}", a.get("bobot", 0)) or 0
+    with st.expander(f"Aspek {kode} · {nama_now} — {float(bobot_now):.1f}%", expanded=True):
+        h1, h2, h3 = st.columns([3, 1, 1])
+        a["nama"] = h1.text_input("Nama aspek", value=str(a.get("nama", "")), key=f"nama_{aid}")
+        a["bobot"] = h2.number_input("Bobot aspek (%)", value=float(a.get("bobot", 0) or 0),
+                                     min_value=0.0, max_value=100.0, step=1.0, format="%.1f",
+                                     key=f"bobot_{aid}")
+        if h3.button("🗑️ Hapus aspek", key=f"del_{aid}", width='stretch'):
+            to_delete.append(aid)
+        a["pertimbangan"] = st.text_input("Pertimbangan aspek (Lamp 6.1)",
+                                          value=str(a.get("pertimbangan", "")), key=f"pert_{aid}")
 
-# validasi bobot kriteria per aspek
-for lvl, msg in validasi(aspek_ed, sub_ed):
-    if "kriteria" in msg and lvl == "error":
-        st.warning(msg)
+        edited = st.data_editor(
+            st.session_state.sub_data.get(aid, empty_sub_df()),
+            num_rows="dynamic", width='stretch', key=f"sub_{aid}",
+            column_config=sub_colcfg)
+        st.session_state.sub_data[aid] = edited
 
-# ---------------------------------------------------------------- hitung
-df_hasil, ring = hitung_matriks(aspek_ed, sub_ed, cfg)
+        s = pd.to_numeric(edited["bobot"], errors="coerce").fillna(0).sum() if not edited.empty else 0
+        (st.success if abs(s - 100) <= 0.1 else st.error)(
+            f"Σ bobot kriteria aspek {kode} = {s:.1f}%"
+            + ("  ✓" if abs(s - 100) <= 0.1 else "  (harus 100%)"))
 
-st.subheader("3️⃣ Matriks Hasil (otomatis)")
+if to_delete:
+    for aid in to_delete:
+        st.session_state.aspek_list = [x for x in st.session_state.aspek_list if x["id"] != aid]
+        st.session_state.sub_data.pop(aid, None)
+    st.rerun()
+
+# ================================================================ hitung
+df_aspek, df_sub = assemble()
+meta = {mk: st.session_state[k] for k, mk in _META_KEYS.items()}
+df_hasil, ring = hitung_matriks(df_aspek, df_sub, cfg)
+
+st.subheader("2️⃣ Matriks Hasil (otomatis)")
 if df_hasil.empty:
-    st.info("Belum ada sub-aspek untuk dihitung.")
+    st.info("Belum ada kriteria terisi untuk dihitung.")
 else:
-    def _highlight(row):
-        warna = "background-color:#fce4e4" if row["Kesimpulan Sub-Aspek"] == "MENYIMPANG SECARA MATERIAL" else ""
-        return [warna] * len(row)
+    def _hl(row):
+        return ["background-color:#fce4e4" if row["Kesimpulan Sub-Aspek"] == "MENYIMPANG SECARA MATERIAL" else ""] * len(row)
     st.dataframe(
-        df_hasil.style.apply(_highlight, axis=1).format({
-            "Bobot Aspek": "{:.3f}", "Bobot Kriteria": "{:.3f}",
-            "Nilai Tertimbang": "{:.3f}", "Skala Temuan": "{:.3f}",
-            "Skor Temuan": "{:.2f}", "Skor Penyimpangan": "{:.3f}",
-            "Batas Penyimpangan": "{:.3f}", "Selisih Penyimpangan": "{:.3f}",
-        }, na_rep="-"),
+        df_hasil.style.apply(_hl, axis=1).format({
+            "Bobot Aspek": "{:.3f}", "Bobot Kriteria": "{:.3f}", "Nilai Tertimbang": "{:.3f}",
+            "Skala Temuan": "{:.3f}", "Skor Temuan": "{:.2f}", "Skor Penyimpangan": "{:.3f}",
+            "Batas Penyimpangan": "{:.3f}", "Selisih Penyimpangan": "{:.3f}"}, na_rep="-"),
         width='stretch', height=460)
 
-# ---------------------------------------------------------------- kesimpulan
-st.subheader("4️⃣ Kesimpulan")
-warna_kat = {"SESUAI": "green", "SESUAI DENGAN PENGECUALIAN": "orange",
-             "TIDAK SESUAI": "red"}.get(ring["kategori"], "gray")
-c1, c2, c3 = st.columns(3)
-c1.metric("Total Skor Temuan", f'{ring["total_skor"]:.2f}')
-c2.metric("Sub-aspek menyimpang", f'{ring["n_menyimpang"]} / {ring["n_sub"]}')
-c3.metric("Total selisih penyimpangan", f'{ring["total_selisih"]:.3f}')
-st.markdown(f"### Kategori: :{warna_kat}[**{ring['kategori']}**]")
-
+# ================================================================ kesimpulan
+st.subheader("3️⃣ Kesimpulan")
+warna = {"SESUAI": "green", "SESUAI DENGAN PENGECUALIAN": "orange",
+         "TIDAK SESUAI": "red"}.get(ring["kategori"], "gray")
+k1, k2, k3 = st.columns(3)
+k1.metric("Total Skor Temuan", f'{ring["total_skor"]:.2f}')
+k2.metric("Sub-aspek menyimpang", f'{ring["n_menyimpang"]} / {ring["n_sub"]}')
+k3.metric("Total selisih penyimpangan", f'{ring["total_selisih"]:.3f}')
+st.markdown(f"### Kategori: :{warna}[**{ring['kategori']}**]")
 if ring["kategori"] == "SESUAI DENGAN PENGECUALIAN":
-    st.info("Kategori 'sesuai dengan pengecualian' memerlukan **judgment pervasiveness**: "
-            "tentukan apakah temuan menyimpang terkonsentrasi pada aspek tertentu.")
+    st.info("Kategori 'sesuai dengan pengecualian' memerlukan **judgment pervasiveness**.")
+st.text_area("Judgment pervasiveness / catatan pemeriksa", key="judgment_text",
+             placeholder="Mis. Penyimpangan hanya pada Aspek C dan tidak pervasive → "
+                         "'Sesuai dengan pengecualian pada Aspek C'.", height=90)
 
-st.text_area(
-    "Judgment pervasiveness / catatan pemeriksa",
-    key="judgment_text",
-    placeholder="Mis. Penyimpangan hanya pada Aspek C dan tidak pervasive → "
-                "'Sesuai dengan pengecualian pada Aspek C'.",
-    height=90)
-
-# ---------------------------------------------------------------- ekspor
-st.subheader("5️⃣ Unduh Lampiran")
-st.caption("Satu file Excel berisi 4 sheet — **Lampiran 6.1, 6.2, 6.3, 6.4** — dengan struktur "
-           "dan formula hidup persis workbook asli. Nilai terhitung ulang otomatis di Excel.")
+# ================================================================ unduh
+st.subheader("4️⃣ Unduh Lampiran")
+st.caption("Satu file Excel berisi 4 sheet (Lampiran 6.1–6.4) dengan formula hidup.")
 if df_hasil.empty:
     st.info("Isi data dulu untuk mengunduh lampiran.")
 else:
-    xlsx_full = build_lampiran_workbook(meta, aspek_ed, sub_ed, cfg,
-                                        st.session_state.judgment_text)
-    st.download_button("⬇️ Unduh Matriks_Kesimpulan.xlsx (Lampiran 6.1–6.4)",
-                       data=xlsx_full, file_name="Matriks_Kesimpulan.xlsx",
+    xlsx = build_lampiran_workbook(meta, df_aspek, df_sub, cfg, st.session_state.judgment_text)
+    st.download_button("⬇️ Unduh Matriks_Kesimpulan.xlsx (Lampiran 6.1–6.4)", data=xlsx,
+                       file_name="Matriks_Kesimpulan.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        width='stretch')
