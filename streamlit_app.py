@@ -4,12 +4,6 @@ Aplikasi Penarikan Kesimpulan Pemeriksaan Kepatuhan — Streamlit (single-file)
 Menjalankan:
     pip install streamlit pandas openpyxl
     streamlit run app.py
-
-Struktur file ini (digabung dari beberapa modul supaya cukup 1 file):
-  1) ENGINE   - perhitungan murni (bobot -> skor -> kesimpulan)
-  2) EXPORTER - generator Lampiran 6.1-6.4 (satu file .xlsx, formula hidup)
-  3) SEED     - data contoh dari workbook sumber (total = 1,66)
-  4) APP (UI) - antarmuka Streamlit
 ==============================================================================
 """
 
@@ -26,9 +20,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 
-# ==============================================================================
-# 1) ENGINE
-# ==============================================================================
+# =========================== 1) ENGINE ===========================
 def xround(value: float, digits: int = 2) -> float:
     """ROUND ala Excel (half away from zero), bukan banker's rounding Python.
     Contoh: xround(0.125, 2) -> 0.13 (Python round -> 0.12)."""
@@ -47,25 +39,51 @@ class Config:
     batas_penyimpangan: float = 0.3      # skala penyimpangan yang ditoleransi (default 0,3 = 10%)
     ambang_sesuai: float = 1.3           # < ini -> SESUAI
     ambang_tidak_sesuai: float = 1.8     # > ini -> TIDAK SESUAI
+    # Bobot tiap parameter temuan (Lamp 6.3). Default sama-rata (0,25 tiap parameter)
+    # -> menghasilkan rata-rata sederhana, identik dengan contoh workbook.
+    # Bisa diubah, mis. {"Nilai":0.4,"Dampak":0.3,"Sensitivitas":0.1,"Fraud":0.2}.
+    bobot_parameter: dict = field(default_factory=lambda: {
+        "Nilai": 0.25, "Dampak": 0.25, "Sensitivitas": 0.25, "Fraud": 0.25})
+
+    @property
+    def parameter_sama_rata(self) -> bool:
+        w = [self.bobot_parameter.get(p, 0) for p in PARAMETER_TEMUAN]
+        return max(w) - min(w) < 1e-9
 
 
 # ----------------------------------------------------------------------
 # Fungsi-fungsi murni per baris
 # ----------------------------------------------------------------------
 
-def hitung_skala(mode: str, skala_langsung, params: dict) -> Optional[float]:
-    """Kembalikan skala temuan 1..4, atau None kalau input belum lengkap."""
+def hitung_skala(mode: str, skala_langsung, params: dict,
+                 bobot_parameter: Optional[dict] = None) -> Optional[float]:
+    """Kembalikan skala temuan 1..4, atau None kalau input belum lengkap.
+
+    Rata-rata parameter yang terisi (>0). Kalau bobot_parameter diberikan,
+    dipakai rata-rata TERTIMBANG: Σ(nilai_i × bobot_i) / Σ(bobot_i) hanya atas
+    parameter yang terisi. Bila semua bobot sama, hasilnya = rata-rata sederhana.
+    """
     if str(mode).lower().startswith("langsung"):
         try:
             v = float(skala_langsung)
         except (TypeError, ValueError):
             return None
         return v
-    # mode parameter -> rata-rata parameter yang terisi (>0)
-    nilai = [float(v) for v in params.values() if v is not None and str(v) != "" and float(v) > 0]
-    if not nilai:
+    # mode parameter -> kumpulkan parameter yang terisi (>0)
+    terisi = {}
+    for p in PARAMETER_TEMUAN:
+        v = params.get(p)
+        if v is not None and str(v) != "" and float(v) > 0:
+            terisi[p] = float(v)
+    if not terisi:
         return None
-    return xround(sum(nilai) / len(nilai), 3)
+    if bobot_parameter:
+        total_bobot = sum(bobot_parameter.get(p, 0) for p in terisi)
+        if total_bobot > 0:
+            skor = sum(terisi[p] * bobot_parameter.get(p, 0) for p in terisi) / total_bobot
+            return xround(skor, 3)
+    # fallback: rata-rata sederhana
+    return xround(sum(terisi.values()) / len(terisi), 3)
 
 
 def hitung_baris(bobot_aspek: float, bobot_kriteria: float, skala: Optional[float],
@@ -126,7 +144,8 @@ def hitung_matriks(df_aspek: pd.DataFrame, df_sub: pd.DataFrame, cfg: Config):
         bobot_aspek = bobot_map.get(kode, 0.0)
         bobot_kriteria = float(r.get("bobot_kriteria") or 0)
         params = {p: r.get(p) for p in PARAMETER_TEMUAN}
-        skala = hitung_skala(r.get("mode", "Parameter"), r.get("skala_langsung"), params)
+        skala = hitung_skala(r.get("mode", "Parameter"), r.get("skala_langsung"), params,
+                             cfg.bobot_parameter)
         calc = hitung_baris(bobot_aspek, bobot_kriteria, skala, cfg)
         rows.append({
             "Kode Aspek": kode,
@@ -283,9 +302,7 @@ def ekspor_excel(metadata: dict, df_hasil: pd.DataFrame, ringkasan: dict,
     return buf.getvalue()
 
 
-# ==============================================================================
-# 2) EXPORTER — Lampiran 6.1 s.d 6.4 (formula hidup)
-# ==============================================================================
+# =========================== 2) EXPORTER ===========================
 # ---- gaya ----
 FONT = "Arial"
 _reg = Font(name=FONT, size=10)
@@ -414,11 +431,18 @@ def build_lampiran_workbook(metadata: dict, df_aspek, df_sub, cfg: Config,
         ws62.column_dimensions[col].width = w
 
     # ================= LAMP 6.3 =================
+    bp = cfg.bobot_parameter or {p: 0.25 for p in ("Nilai", "Dampak", "Sensitivitas", "Fraud")}
+    sama_rata = (max(bp.values()) - min(bp.values())) < 1e-9
     _put(ws63, 1, 11, "Lampiran 6.3", _lamp, _wrapC)
     _put(ws63, 2, 2, "Pembobotan Temuan", _subhdr, _wrapL)
     _put(ws63, 4, 2, "Parameter pertimbangan: Nilai, Dampak, Sensitivitas/harapan publik, "
                      "Indikasi Fraud. Skala 1 (rendah) s.d 4 (tinggi).", _reg, _wrapL)
-    _put(ws63, 5, 2, "Rata-rata = jumlah parameter dibagi banyaknya parameter yang dipakai.", _small, _wrapL)
+    if sama_rata:
+        _put(ws63, 5, 2, "Rata-rata = jumlah parameter dibagi banyaknya parameter yang dipakai "
+                         "(bobot tiap parameter dianggap sama).", _small, _wrapL)
+    else:
+        _bobot_txt = ", ".join(f"{p} {bp[p]*100:.0f}%" for p in ("Nilai", "Dampak", "Sensitivitas", "Fraud"))
+        _put(ws63, 5, 2, f"Rata-rata TERTIMBANG dengan bobot parameter: {_bobot_txt}.", _small, _wrapL)
     hdr = 7
     heads = ["Sub aspek/kriteria", "Temuan", "Nilai", "Dampak",
              "Sensitivitas/ harapan publik", "Indikasi Fraud", "Jumlah", "Rata Rata*"]
@@ -431,7 +455,8 @@ def build_lampiran_workbook(metadata: dict, df_aspek, df_sub, cfg: Config,
             _put(ws63, r, 4, str(s.get("kriteria", "") or ""), _reg, _wrapL, True)
             _put(ws63, r, 5, str(s.get("temuan", "") or ""), _reg, _wrapL, True)
             mode = str(s.get("mode", "Parameter"))
-            present = []
+            present = []       # nama parameter yang terisi
+            present_cells = [] # koordinat sel
             if mode.lower().startswith("langsung"):
                 for p, cc in param_cols.items():
                     _put(ws63, r, cc, "", _reg, _wrapC, True)
@@ -444,18 +469,33 @@ def build_lampiran_workbook(metadata: dict, df_aspek, df_sub, cfg: Config,
                     v = s.get(p)
                     if v not in (None, "") and float(v) > 0:
                         _put(ws63, r, cc, float(v), _reg, _wrapC, True)
-                        present.append(get_column_letter(cc) + str(r))
+                        present.append(p)
+                        present_cells.append(get_column_letter(cc) + str(r))
                     else:
                         _put(ws63, r, cc, "", _reg, _wrapC, True)
                 if present:
-                    _put(ws63, r, 10, "=" + "+".join(present), _reg, _wrapC, True)  # Jumlah
-                    _put(ws63, r, 11, f"=ROUND(J{r}/{len(present)},3)", _reg, _wrapC, True, numfmt="0.000")
+                    # Jumlah = penjumlahan sederhana (untuk keterlacakan, seperti contoh)
+                    _put(ws63, r, 10, "=" + "+".join(present_cells), _reg, _wrapC, True)
+                    if sama_rata:
+                        _put(ws63, r, 11, f"=ROUND(J{r}/{len(present)},3)",
+                             _reg, _wrapC, True, numfmt="0.000")
+                    else:
+                        # Rata TERTIMBANG: Σ(nilai×bobot)/Σ(bobot) atas parameter terisi
+                        pemb = "+".join(f"{cell}*{bp[p]}" for p, cell in zip(present, present_cells))
+                        total_bobot = sum(bp[p] for p in present)
+                        _put(ws63, r, 11, f"=ROUND(({pemb})/{total_bobot},3)",
+                             _reg, _wrapC, True, numfmt="0.000")
                 else:
                     _put(ws63, r, 10, "", _reg, _wrapC, True)
                     _put(ws63, r, 11, 0, _reg, _wrapC, True, numfmt="0.000")
             sub_rata_cell[(a["kode"], j)] = f"K{r}"
             r += 1
-    _put(ws63, r + 1, 4, "*Pembagi = banyaknya parameter yang digunakan (bisa < 4).", _small, _wrapL)
+    if sama_rata:
+        _put(ws63, r + 1, 4, "*Bobot tiap parameter dianggap sama; pembagi = banyaknya "
+                             "parameter yang dipakai (bisa < 4).", _small, _wrapL)
+    else:
+        _put(ws63, r + 1, 4, "*Rata-rata tertimbang. Pemeriksa membobot parameter tidak sama; "
+                             "bobot dinormalkan atas parameter yang terisi.", _small, _wrapL)
     for w, col in zip([3, 3, 3, 32, 26, 7, 7, 12, 7, 8, 10], "ABCDEFGHIJK"):
         ws63.column_dimensions[col].width = w
 
@@ -561,9 +601,7 @@ def build_lampiran_workbook(metadata: dict, df_aspek, df_sub, cfg: Config,
     return buf.getvalue()
 
 
-# ==============================================================================
-# 3) SEED DATA — contoh dari workbook sumber
-# ==============================================================================
+# =========================== 3) SEED DATA ===========================
 METADATA_DEFAULT = {
     "tujuan": "Memberikan simpulan apakah kegiatan pelaksanaan belanja telah sesuai kriteria",
     "subject_matter": "Pelaksanaan belanja terkait ...",
@@ -615,18 +653,33 @@ SUB_SEED = pd.DataFrame(
 )
 
 
-# ==============================================================================
-# 4) APLIKASI STREAMLIT (UI)
-# ==============================================================================
+# =========================== 4) APLIKASI STREAMLIT ===========================
 st.set_page_config(page_title="Matriks Penyimpulan Pemeriksaan Kepatuhan",
                    page_icon="📋", layout="wide")
 
 # ---------------------------------------------------------------- state init
+# PENTING: widget teks (text_area/text_input) di bawah diikat via `key=` ke
+# st.session_state, BUKAN lewat pola `value=... lalu reassign manual`.
+# Pola lama (`m["x"] = st.text_area("...", m.get("x",""))`) membuat Streamlit
+# menganggap tiap perubahan value sebagai widget baru (karena tidak ada key
+# eksplisit, key di-auto-generate dari value) -> input yang baru diketik
+# "hilang" dan harus dikonfirmasi ulang (perlu Ctrl+Enter 2x). Dengan `key=`,
+# Streamlit langsung menjadikan session_state sebagai sumber kebenaran tunggal
+# sehingga satu kali Ctrl+Enter/Enter sudah cukup.
+_META_KEYS = {  # session_state key -> field metadata
+    "meta_tujuan": "tujuan",
+    "meta_subject_matter": "subject_matter",
+    "meta_lingkup": "lingkup",
+    "meta_total_kontrak": "total_kontrak",
+    "meta_sampling": "sampling",
+}
+
 if "aspek" not in st.session_state:
     st.session_state.aspek = ASPEK_SEED.copy()
     st.session_state.sub = SUB_SEED.copy()
-    st.session_state.meta = dict(METADATA_DEFAULT)
-    st.session_state.judgment = ""
+    for _skey, _mkey in _META_KEYS.items():
+        st.session_state[_skey] = METADATA_DEFAULT.get(_mkey, "")
+    st.session_state.judgment_text = ""
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
@@ -636,18 +689,38 @@ with st.sidebar:
                             help="Default 0,3 (≈10%). Diproporsionalkan per sub-aspek: batas × nilai tertimbang.")
     amb_sesuai = st.number_input("Ambang SESUAI (< nilai ini)", 0.0, 4.0, value=1.3, step=0.1)
     amb_tidak = st.number_input("Ambang TIDAK SESUAI (> nilai ini)", 0.0, 4.0, value=1.8, step=0.1)
+
+    st.divider()
+    st.subheader("Bobot parameter temuan (Lamp 6.3)")
+    sama_rata = st.toggle("Sama rata (default)", value=True,
+                          help="Aktif: skala = rata-rata sederhana Nilai/Dampak/Sensitivitas/Fraud. "
+                               "Nonaktif: tentukan bobot tiap parameter (mis. 40/30/10/20).")
+    if sama_rata:
+        bobot_param = {p: 0.25 for p in PARAMETER_TEMUAN}
+    else:
+        st.caption("Bobot dinormalkan otomatis (tak harus total 100%).")
+        wN = st.number_input("Nilai (%)", 0, 100, value=40, step=5)
+        wD = st.number_input("Dampak (%)", 0, 100, value=30, step=5)
+        wS = st.number_input("Sensitivitas (%)", 0, 100, value=10, step=5)
+        wF = st.number_input("Fraud (%)", 0, 100, value=20, step=5)
+        tot = (wN + wD + wS + wF) or 1
+        bobot_param = {"Nilai": wN / tot, "Dampak": wD / tot,
+                       "Sensitivitas": wS / tot, "Fraud": wF / tot}
+        st.caption("Efektif: " + " · ".join(f"{p} {bobot_param[p]*100:.0f}%" for p in PARAMETER_TEMUAN))
+
     cfg = Config(batas_penyimpangan=batas, ambang_sesuai=amb_sesuai,
-                 ambang_tidak_sesuai=amb_tidak)
+                 ambang_tidak_sesuai=amb_tidak, bobot_parameter=bobot_param)
 
     st.divider()
     st.caption("Reset ke data contoh workbook:")
-    if st.button("↺ Muat ulang data contoh", use_container_width=True):
+    if st.button("↺ Muat ulang data contoh", width='stretch'):
         st.session_state.aspek = ASPEK_SEED.copy()
         st.session_state.sub = SUB_SEED.copy()
-        st.session_state.meta = dict(METADATA_DEFAULT)
-        st.session_state.judgment = ""
+        for _skey, _mkey in _META_KEYS.items():
+            st.session_state[_skey] = METADATA_DEFAULT.get(_mkey, "")
+        st.session_state.judgment_text = ""
         st.rerun()
-    if st.button("🗑️ Kosongkan semua", use_container_width=True):
+    if st.button("🗑️ Kosongkan semua", width='stretch'):
         st.session_state.aspek = ASPEK_SEED.iloc[0:0].copy()
         st.session_state.sub = SUB_SEED.iloc[0:0].copy()
         st.rerun()
@@ -657,19 +730,20 @@ st.caption("Replikasi Lampiran 6.1–6.4 · pembobotan Aspek → Sub-aspek → T
 
 # ---------------------------------------------------------------- metadata
 with st.expander("🧾 Identitas Pemeriksaan", expanded=False):
-    m = st.session_state.meta
     c1, c2 = st.columns(2)
-    m["tujuan"] = c1.text_area("Tujuan Pemeriksaan", m.get("tujuan", ""), height=70)
-    m["subject_matter"] = c2.text_area("Subject Matter", m.get("subject_matter", ""), height=70)
-    m["lingkup"] = c1.text_input("Lingkup", m.get("lingkup", ""))
-    m["total_kontrak"] = c2.text_input("Total Kontrak", m.get("total_kontrak", ""))
-    m["sampling"] = c1.text_input("Sampling", m.get("sampling", ""))
+    c1.text_area("Tujuan Pemeriksaan", key="meta_tujuan", height=70)
+    c2.text_area("Subject Matter", key="meta_subject_matter", height=70)
+    c1.text_input("Lingkup", key="meta_lingkup")
+    c2.text_input("Total Kontrak", key="meta_total_kontrak")
+    c1.text_input("Sampling", key="meta_sampling")
+
+meta = {_mkey: st.session_state[_skey] for _skey, _mkey in _META_KEYS.items()}
 
 # ---------------------------------------------------------------- input aspek
 st.subheader("1️⃣ Aspek & Bobot")
 st.caption("Σ bobot aspek harus = 1,000. Tambah/hapus baris lewat tabel.")
 aspek_ed = st.data_editor(
-    st.session_state.aspek, num_rows="dynamic", use_container_width=True,
+    st.session_state.aspek, num_rows="dynamic", width='stretch',
     key="ed_aspek",
     column_config={
         "kode": st.column_config.TextColumn("Kode", width="small", required=True),
@@ -685,11 +759,15 @@ tot_aspek = pd.to_numeric(aspek_ed["bobot_aspek"], errors="coerce").fillna(0).su
 
 # ---------------------------------------------------------------- input sub-aspek
 st.subheader("2️⃣ Sub-Aspek / Kriteria & Skala Temuan")
-st.caption("Mode **Parameter**: isi Nilai/Dampak/Sensitivitas/Fraud (1–4), skala = rata-rata "
-           "parameter terisi. Mode **Langsung**: pakai kolom *Skala Langsung* (1–4).")
+_skema = ("rata-rata sederhana (bobot parameter sama)" if cfg.parameter_sama_rata
+          else "rata-rata tertimbang: " + ", ".join(
+              f"{p} {cfg.bobot_parameter[p]*100:.0f}%" for p in PARAMETER_TEMUAN))
+st.caption(f"Mode **Parameter**: isi Nilai/Dampak/Sensitivitas/Fraud (1–4), skala dihitung "
+           f"dengan {_skema}. Mode **Langsung**: pakai kolom *Skala Langsung* (1–4). "
+           f"Ubah skema bobot parameter di sidebar.")
 kode_opsi = [str(k).strip() for k in aspek_ed["kode"].dropna().tolist() if str(k).strip()]
 sub_ed = st.data_editor(
-    st.session_state.sub, num_rows="dynamic", use_container_width=True,
+    st.session_state.sub, num_rows="dynamic", width='stretch',
     key="ed_sub",
     column_config={
         "kode_aspek": st.column_config.SelectboxColumn("Aspek", options=kode_opsi,
@@ -733,7 +811,7 @@ else:
             "Skor Temuan": "{:.2f}", "Skor Penyimpangan": "{:.3f}",
             "Batas Penyimpangan": "{:.3f}", "Selisih Penyimpangan": "{:.3f}",
         }, na_rep="-"),
-        use_container_width=True, height=460)
+        width='stretch', height=460)
 
 # ---------------------------------------------------------------- kesimpulan
 st.subheader("4️⃣ Kesimpulan")
@@ -749,9 +827,9 @@ if ring["kategori"] == "SESUAI DENGAN PENGECUALIAN":
     st.info("Kategori 'sesuai dengan pengecualian' memerlukan **judgment pervasiveness**: "
             "tentukan apakah temuan menyimpang terkonsentrasi pada aspek tertentu.")
 
-st.session_state.judgment = st.text_area(
+st.text_area(
     "Judgment pervasiveness / catatan pemeriksa",
-    st.session_state.judgment,
+    key="judgment_text",
     placeholder="Mis. Penyimpangan hanya pada Aspek C dan tidak pervasive → "
                 "'Sesuai dengan pengecualian pada Aspek C'.",
     height=90)
@@ -763,9 +841,9 @@ st.caption("Satu file Excel berisi 4 sheet — **Lampiran 6.1, 6.2, 6.3, 6.4** �
 if df_hasil.empty:
     st.info("Isi data dulu untuk mengunduh lampiran.")
 else:
-    xlsx_full = build_lampiran_workbook(st.session_state.meta, aspek_ed, sub_ed, cfg,
-                                        st.session_state.judgment)
+    xlsx_full = build_lampiran_workbook(meta, aspek_ed, sub_ed, cfg,
+                                        st.session_state.judgment_text)
     st.download_button("⬇️ Unduh Matriks_Kesimpulan.xlsx (Lampiran 6.1–6.4)",
                        data=xlsx_full, file_name="Matriks_Kesimpulan.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       use_container_width=True)
+                       width='stretch')
