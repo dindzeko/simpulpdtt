@@ -1,7 +1,8 @@
 """
 Aplikasi Penarikan Kesimpulan Pemeriksaan Kepatuhan — Streamlit (single-file)
-Per-aspek tuntas (blok expander), bobot %, nomor kriteria otomatis (1.1, 1.2, ...),
-input tersimpan otomatis (pola base-stabil), tombol Tambah aspek & Tambah sub-aspek.
+Per-aspek tuntas (blok expander). Bobot % (Σ=100% untuk aspek & sub-kriteria).
+Nomor sub-kriteria otomatis (1.1, 1.2, ...). OPSI B: Temuan terpisah & tak dibobot;
+satu sub-kriteria boleh punya banyak temuan (digabung otomatis ke Lampiran 6.3/6.4).
 Menjalankan:  pip install streamlit pandas openpyxl ;  streamlit run app.py
 """
 
@@ -655,14 +656,14 @@ st.set_page_config(page_title="Matriks Penyimpulan Pemeriksaan Kepatuhan",
                    page_icon="📋", layout="wide")
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-SUB_COLS = ["kriteria", "bobot", "pertimbangan", "temuan", "mode",
+# Tabel sub-kriteria: TANPA kolom temuan (temuan dikelola terpisah)
+SUB_COLS = ["kriteria", "bobot", "pertimbangan", "mode",
             "skala_langsung", "Nilai", "Dampak", "Sensitivitas", "Fraud"]
+_NUM_COLS = {"bobot", "skala_langsung", "Nilai", "Dampak", "Sensitivitas", "Fraud"}
+TEM_COLS = ["kriteria", "temuan"]   # kriteria = referensi nama sub-kriteria
 _META_KEYS = {"meta_tujuan": "tujuan", "meta_subject_matter": "subject_matter",
               "meta_lingkup": "lingkup", "meta_total_kontrak": "total_kontrak",
               "meta_sampling": "sampling"}
-
-
-_NUM_COLS = {"bobot", "skala_langsung", "Nilai", "Dampak", "Sensitivitas", "Fraud"}
 
 
 def empty_sub_df():
@@ -670,49 +671,61 @@ def empty_sub_df():
                          for c in SUB_COLS})
 
 
-def blank_row_df():
+def blank_sub_row():
     row = {c: (None if c in _NUM_COLS else "") for c in SUB_COLS}
     row["mode"] = "Parameter"
     return pd.DataFrame([row])
 
 
+def empty_tem_df():
+    return pd.DataFrame({c: pd.Series(dtype="object") for c in TEM_COLS})
+
+
+def blank_tem_row():
+    return pd.DataFrame([{"kriteria": None, "temuan": ""}])
+
+
 def build_seed_state():
-    """Bangun aspek_list (bobot dalam %) + sub_base {id: df kriteria %} dari seed desimal."""
-    aspek_list, sub_base = [], {}
+    """aspek_list (bobot %) + sub_base {id: df kriteria %} + tem_base {id: df temuan} dari seed."""
+    aspek_list, sub_base, tem_base = [], {}, {}
     for i, (_, ar) in enumerate(ASPEK_SEED.iterrows()):
         aid = f"a{i}"
         aspek_list.append({
-            "id": aid,
-            "nama": str(ar.get("nama", "") or ""),
+            "id": aid, "nama": str(ar.get("nama", "") or ""),
             "bobot": round(float(ar.get("bobot_aspek") or 0) * 100, 3),
             "pertimbangan": str(ar.get("pertimbangan", "") or ""),
         })
         kode = str(ar.get("kode", "") or "").strip()
         rows = SUB_SEED[SUB_SEED["kode_aspek"].astype(str).str.strip() == kode]
-        recs = []
+        recs, tems = [], []
         for _, s in rows.iterrows():
             recs.append({
                 "kriteria": s.get("kriteria", ""),
                 "bobot": round(float(s.get("bobot_kriteria") or 0) * 100, 3),
                 "pertimbangan": s.get("pertimbangan", ""),
-                "temuan": s.get("temuan", ""),
                 "mode": s.get("mode", "Parameter"),
                 "skala_langsung": s.get("skala_langsung"),
                 "Nilai": s.get("Nilai"), "Dampak": s.get("Dampak"),
                 "Sensitivitas": s.get("Sensitivitas"), "Fraud": s.get("Fraud"),
             })
+            t = str(s.get("temuan", "") or "").strip()
+            if t:
+                tems.append({"kriteria": s.get("kriteria", ""), "temuan": t})
         df = pd.DataFrame(recs, columns=SUB_COLS) if recs else empty_sub_df()
         for c in _NUM_COLS:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         sub_base[aid] = df
-    return aspek_list, sub_base
+        tem_base[aid] = pd.DataFrame(tems, columns=TEM_COLS) if tems else empty_tem_df()
+    return aspek_list, sub_base, tem_base
 
 
-def init_state(aspek_list, sub_base, meta):
+def init_state(aspek_list, sub_base, tem_base, meta):
     st.session_state.aspek_list = aspek_list
-    st.session_state.sub_base = sub_base          # base df stabil per aspek
-    st.session_state.sub_ver = {a["id"]: 0 for a in aspek_list}  # versi editor per aspek
-    st.session_state.gen = st.session_state.get("gen", 0) + 1    # generasi (bump saat reset)
+    st.session_state.sub_base = sub_base
+    st.session_state.tem_base = tem_base
+    st.session_state.sub_ver = {a["id"]: 0 for a in aspek_list}
+    st.session_state.tem_ver = {a["id"]: 0 for a in aspek_list}
+    st.session_state.gen = st.session_state.get("gen", 0) + 1
     st.session_state.next_id = len(aspek_list)
     for k, mk in _META_KEYS.items():
         st.session_state[k] = meta.get(mk, "")
@@ -720,42 +733,59 @@ def init_state(aspek_list, sub_base, meta):
 
 
 if "aspek_list" not in st.session_state:
-    _al, _sb = build_seed_state()
-    init_state(_al, _sb, METADATA_DEFAULT)
+    _al, _sb, _tb = build_seed_state()
+    init_state(_al, _sb, _tb, METADATA_DEFAULT)
 
 
-def assemble(sub_map):
-    """Rakit dua DataFrame desimal (kode & nomor berbasis urutan) untuk engine & exporter.
-    sub_map: dict aid -> DataFrame hasil edit terkini (return data_editor)."""
-    aspek_rows, sub_rows = [], []
+def _join_temuan(items):
+    if len(items) == 1:
+        return items[0]
+    return "\n".join(f"{k + 1}. {t}" for k, t in enumerate(items))
+
+
+def assemble(sub_map, tem_map):
+    """Rakit df_aspek & df_sub (desimal). Temuan dari tem_map digabung per kriteria.
+    Return (df_aspek, df_sub, unmatched) — unmatched: {kode: jumlah temuan tak terhubung}."""
+    aspek_rows, sub_rows, unmatched = [], [], {}
     for i, a in enumerate(st.session_state.aspek_list):
         aid = a["id"]
         kode = LETTERS[i] if i < len(LETTERS) else f"A{i}"
-        nama = a.get("nama", "")
-        bobot_pct = a.get("bobot", 0) or 0
-        pert = a.get("pertimbangan", "")
-        aspek_rows.append({"kode": kode, "nama": nama,
-                           "bobot_aspek": float(bobot_pct) / 100, "pertimbangan": pert})
+        aspek_rows.append({"kode": kode, "nama": a.get("nama", ""),
+                           "bobot_aspek": float(a.get("bobot", 0) or 0) / 100,
+                           "pertimbangan": a.get("pertimbangan", "")})
         sdf = sub_map.get(aid, empty_sub_df())
-        urut = 0  # urutan kriteria dalam aspek ini (yang terisi)
+        tdf = tem_map.get(aid, empty_tem_df())
+        groups = {}
+        for _, tr in tdf.iterrows():
+            ref = str(tr.get("kriteria", "") or "").strip().lower()
+            txt = str(tr.get("temuan", "") or "").strip()
+            if ref and txt:
+                groups.setdefault(ref, []).append(txt)
+        used, urut = set(), 0
         for _, r in sdf.iterrows():
-            if not str(r.get("kriteria", "") or "").strip():
+            name = str(r.get("kriteria", "") or "").strip()
+            if not name:
                 continue
             urut += 1
+            items = groups.get(name.lower(), [])
+            used.add(name.lower())
             sub_rows.append({
-                "kode_aspek": kode, "no": f"{i + 1}.{urut}",
-                "kriteria": r.get("kriteria", ""),
-                "bobot_kriteria": (float(r.get("bobot") or 0)) / 100,
-                "temuan": r.get("temuan", ""), "pertimbangan": r.get("pertimbangan", ""),
+                "kode_aspek": kode, "no": f"{i + 1}.{urut}", "kriteria": name,
+                "bobot_kriteria": float(r.get("bobot") or 0) / 100,
+                "temuan": _join_temuan(items) if items else "",
+                "pertimbangan": r.get("pertimbangan", ""),
                 "mode": r.get("mode", "Parameter"), "skala_langsung": r.get("skala_langsung"),
                 "Nilai": r.get("Nilai"), "Dampak": r.get("Dampak"),
                 "Sensitivitas": r.get("Sensitivitas"), "Fraud": r.get("Fraud"),
             })
+        un = sum(len(groups[ref]) for ref in groups if ref not in used)
+        if un:
+            unmatched[kode] = un
     df_a = pd.DataFrame(aspek_rows, columns=["kode", "nama", "bobot_aspek", "pertimbangan"])
     df_s = pd.DataFrame(sub_rows, columns=["kode_aspek", "no", "kriteria", "bobot_kriteria",
                                            "temuan", "pertimbangan", "mode", "skala_langsung",
                                            "Nilai", "Dampak", "Sensitivitas", "Fraud"])
-    return df_a, df_s
+    return df_a, df_s, unmatched
 
 
 # ================================================================ sidebar
@@ -787,13 +817,13 @@ with st.sidebar:
 
     st.divider()
     if st.button("↺ Muat ulang data contoh", width='stretch'):
-        _al, _sb = build_seed_state(); init_state(_al, _sb, METADATA_DEFAULT); st.rerun()
+        _al, _sb, _tb = build_seed_state(); init_state(_al, _sb, _tb, METADATA_DEFAULT); st.rerun()
     if st.button("🗑️ Kosongkan semua", width='stretch'):
-        init_state([], {}, {k: "" for k in METADATA_DEFAULT}); st.rerun()
+        init_state([], {}, {}, {k: "" for k in METADATA_DEFAULT}); st.rerun()
 
 st.title("📋 Matriks Penyimpulan Pemeriksaan Kepatuhan")
-st.caption("Alur per-aspek tuntas · Aspek → Sub-aspek/Kriteria → Temuan · bobot dalam % · "
-           "rekalkulasi otomatis · isian tersimpan otomatis saat pindah/klik ke luar sel")
+st.caption("Per-aspek tuntas · Aspek → Sub-Kriteria (dibobot) → Temuan (tak dibobot, boleh banyak) · "
+           "bobot dalam % · isian tersimpan otomatis saat pindah/klik ke luar sel")
 
 # ================================================================ metadata
 with st.expander("🧾 Identitas Pemeriksaan", expanded=False):
@@ -805,7 +835,7 @@ with st.expander("🧾 Identitas Pemeriksaan", expanded=False):
     c1.text_input("Sampling", key="meta_sampling")
 
 # ================================================================ kontrol global aspek
-st.subheader("1️⃣ Aspek & Kriteria (per-aspek)")
+st.subheader("1️⃣ Aspek → Sub-Kriteria → Temuan (per-aspek)")
 tot_aspek = sum(float(st.session_state.get(f"bobot_{a['id']}", a.get("bobot", 0)) or 0)
                 for a in st.session_state.aspek_list)
 cc1, cc2 = st.columns([3, 1])
@@ -815,15 +845,16 @@ if cc2.button("➕ Tambah aspek", width='stretch'):
     nid = f"a{st.session_state.next_id}"; st.session_state.next_id += 1
     st.session_state.aspek_list.append({"id": nid, "nama": "", "bobot": 0.0, "pertimbangan": ""})
     st.session_state.sub_base[nid] = empty_sub_df()
+    st.session_state.tem_base[nid] = empty_tem_df()
     st.session_state.sub_ver[nid] = 0
+    st.session_state.tem_ver[nid] = 0
     st.rerun()
 
 sub_colcfg = {
-    "kriteria": st.column_config.TextColumn("Sub-Aspek / Kriteria", width="large"),
+    "kriteria": st.column_config.TextColumn("Sub-Kriteria", width="large"),
     "bobot": st.column_config.NumberColumn("Bobot (%)", min_value=0.0, max_value=100.0,
                                            step=1.0, format="%.1f"),
     "pertimbangan": st.column_config.TextColumn("Pertimbangan (Lamp 6.2)", width="medium"),
-    "temuan": st.column_config.TextColumn("Temuan (catatan)", width="medium"),
     "mode": st.column_config.SelectboxColumn("Mode", options=["Parameter", "Langsung"], width="small"),
     "skala_langsung": st.column_config.NumberColumn("Skala Langsung", min_value=1.0, max_value=4.0,
                                                     step=0.25, format="%.2f"),
@@ -834,7 +865,7 @@ sub_colcfg = {
 }
 
 to_delete = []
-current_sub = {}   # aid -> DataFrame hasil edit terkini (dipakai assemble di bawah)
+current_sub, current_tem = {}, {}
 for i, a in enumerate(st.session_state.aspek_list):
     aid = a["id"]
     kode = LETTERS[i] if i < len(LETTERS) else f"A{i}"
@@ -851,43 +882,64 @@ for i, a in enumerate(st.session_state.aspek_list):
         a["pertimbangan"] = st.text_input("Pertimbangan aspek (Lamp 6.1)",
                                           value=str(a.get("pertimbangan", "")), key=f"pert_{aid}")
 
-        st.caption(f"Kriteria otomatis bernomor {i+1}.1, {i+1}.2, … (sesuai urutan baris). "
-                   "Isian tersimpan begitu klik/pindah ke sel lain. "
-                   "Tambah baris lewat tombol di bawah atau baris kosong paling akhir; "
-                   "hapus baris lewat ikon tempat sampah di kiri baris.")
-        # data_editor dengan BASE stabil + key berversi (pola anti kehilangan edit)
-        ver = st.session_state.sub_ver.get(aid, 0)
-        ekey = f"sub_{aid}_{st.session_state.gen}_{ver}"
-        edited = st.data_editor(
-            st.session_state.sub_base[aid], num_rows="dynamic",
-            width='stretch', key=ekey, column_config=sub_colcfg)
-        current_sub[aid] = edited
-
-        s = pd.to_numeric(edited["bobot"], errors="coerce").fillna(0).sum() if not edited.empty else 0
+        # ---- Sub-Kriteria (DIBOBOT) ----
+        st.markdown(f"**Sub-Kriteria** — otomatis bernomor {i+1}.1, {i+1}.2, … · Σ bobot harus 100%")
+        sver = st.session_state.sub_ver.get(aid, 0)
+        skey = f"sub_{aid}_{st.session_state.gen}_{sver}"
+        sub_edited = st.data_editor(st.session_state.sub_base[aid], num_rows="dynamic",
+                                    width='stretch', key=skey, column_config=sub_colcfg)
+        current_sub[aid] = sub_edited
+        s = pd.to_numeric(sub_edited["bobot"], errors="coerce").fillna(0).sum() if not sub_edited.empty else 0
         b1, b2 = st.columns([1, 3])
-        if b1.button("➕ Tambah sub-aspek", key=f"addsub_{aid}", width='stretch'):
-            st.session_state.sub_base[aid] = pd.concat([edited, blank_row_df()], ignore_index=True)
-            st.session_state.sub_ver[aid] = ver + 1
+        if b1.button("➕ Tambah sub-kriteria", key=f"addsub_{aid}", width='stretch'):
+            st.session_state.sub_base[aid] = pd.concat([sub_edited, blank_sub_row()], ignore_index=True)
+            st.session_state.sub_ver[aid] = sver + 1
             st.rerun()
         (b2.success if abs(s - 100) <= 0.1 else b2.error)(
-            f"Σ bobot kriteria aspek {kode} = {s:.1f}%"
+            f"Σ bobot sub-kriteria aspek {kode} = {s:.1f}%"
             + ("  ✓" if abs(s - 100) <= 0.1 else "  (harus 100%)"))
+
+        # ---- Temuan (TIDAK DIBOBOT, boleh banyak per kriteria) ----
+        st.markdown("**Temuan** — tidak dibobot; satu sub-kriteria boleh punya beberapa temuan. "
+                    "Pilih kriteria induk dari dropdown.")
+        names = [str(x).strip() for x in sub_edited["kriteria"].tolist() if str(x or "").strip()]
+        refs = [str(x).strip() for x in st.session_state.tem_base[aid]["kriteria"].tolist()
+                if str(x or "").strip()]
+        opsi = list(dict.fromkeys(names + refs))
+        tem_colcfg = {
+            "kriteria": st.column_config.SelectboxColumn("Untuk sub-kriteria", options=opsi, width="large"),
+            "temuan": st.column_config.TextColumn("Temuan", width="large"),
+        }
+        tver = st.session_state.tem_ver.get(aid, 0)
+        tkey = f"tem_{aid}_{st.session_state.gen}_{tver}"
+        tem_edited = st.data_editor(st.session_state.tem_base[aid], num_rows="dynamic",
+                                    width='stretch', key=tkey, column_config=tem_colcfg)
+        current_tem[aid] = tem_edited
+        if st.button("➕ Tambah temuan", key=f"addtem_{aid}"):
+            st.session_state.tem_base[aid] = pd.concat([tem_edited, blank_tem_row()], ignore_index=True)
+            st.session_state.tem_ver[aid] = tver + 1
+            st.rerun()
 
 if to_delete:
     for aid in to_delete:
         st.session_state.aspek_list = [x for x in st.session_state.aspek_list if x["id"] != aid]
-        st.session_state.sub_base.pop(aid, None)
-        st.session_state.sub_ver.pop(aid, None)
+        for store in ("sub_base", "tem_base", "sub_ver", "tem_ver"):
+            st.session_state[store].pop(aid, None)
     st.rerun()
 
 # ================================================================ hitung
-df_aspek, df_sub = assemble(current_sub)
+df_aspek, df_sub, unmatched = assemble(current_sub, current_tem)
 meta = {mk: st.session_state[k] for k, mk in _META_KEYS.items()}
 df_hasil, ring = hitung_matriks(df_aspek, df_sub, cfg)
 
+if unmatched:
+    detail = ", ".join(f"Aspek {k}: {v}" for k, v in unmatched.items())
+    st.warning(f"Ada temuan yang belum terhubung ke sub-kriteria (nama tidak cocok) — {detail}. "
+               "Pilih ulang kriteria induk pada dropdown temuan.")
+
 st.subheader("2️⃣ Matriks Hasil (otomatis)")
 if df_hasil.empty:
-    st.info("Belum ada kriteria terisi untuk dihitung.")
+    st.info("Belum ada sub-kriteria terisi untuk dihitung.")
 else:
     def _hl(row):
         return ["background-color:#fce4e4" if row["Kesimpulan Sub-Aspek"] == "MENYIMPANG SECARA MATERIAL" else ""] * len(row)
@@ -904,7 +956,7 @@ warna = {"SESUAI": "green", "SESUAI DENGAN PENGECUALIAN": "orange",
          "TIDAK SESUAI": "red"}.get(ring["kategori"], "gray")
 k1, k2, k3 = st.columns(3)
 k1.metric("Total Skor Temuan", f'{ring["total_skor"]:.2f}')
-k2.metric("Sub-aspek menyimpang", f'{ring["n_menyimpang"]} / {ring["n_sub"]}')
+k2.metric("Sub-kriteria menyimpang", f'{ring["n_menyimpang"]} / {ring["n_sub"]}')
 k3.metric("Total selisih penyimpangan", f'{ring["total_selisih"]:.3f}')
 st.markdown(f"### Kategori: :{warna}[**{ring['kategori']}**]")
 if ring["kategori"] == "SESUAI DENGAN PENGECUALIAN":
@@ -915,7 +967,8 @@ st.text_area("Judgment pervasiveness / catatan pemeriksa", key="judgment_text",
 
 # ================================================================ unduh
 st.subheader("4️⃣ Unduh Lampiran")
-st.caption("Satu file Excel berisi 4 sheet (Lampiran 6.1–6.4) dengan formula hidup.")
+st.caption("Satu file Excel berisi 4 sheet (Lampiran 6.1–6.4) dengan formula hidup. "
+           "Temuan yang banyak digabung otomatis pada baris sub-kriteria terkait.")
 if df_hasil.empty:
     st.info("Isi data dulu untuk mengunduh lampiran.")
 else:
